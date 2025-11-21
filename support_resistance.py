@@ -2,239 +2,236 @@ import cv2
 import numpy as np
 import sys
 import os
-from scipy.signal import find_peaks
 
-class StockChartAnalyzer:
+class SniperZoneAnalyzer:
     def __init__(self, image, mask):
         self.original_image = image
         self.candlestick_mask = mask
         self.price_series = []
-        self.pivots = []
-        self.sd_zones = []
+        self.zones = []
         if mask is not None:
-            self.image_height, self.image_width = mask.shape
+            self.h, self.w = mask.shape
         else:
-            self.image_height, self.image_width = (0, 0)
+            self.h, self.w = (0, 0)
 
     def extract_price_data(self):
         if self.candlestick_mask is None: return
-
-        raw_data = []
-        # Initialize price map for fast lookups: index is x-coordinate
-        self.price_map = [None] * self.image_width
-
-        for x in range(self.image_width):
+        raw_data = [None] * self.w
+        for x in range(self.w):
             column = self.candlestick_mask[:, x]
             pixels = np.where(column > 0)[0]
             if len(pixels) > 0:
                 high_y = np.min(pixels)
                 low_y = np.max(pixels)
-                if (low_y - high_y) < 2: continue
-                entry = {'x': x, 'high': high_y, 'low': low_y}
-                raw_data.append(entry)
-                self.price_map[x] = entry
+                if (low_y - high_y) > 1:
+                    raw_data[x] = {'high': high_y, 'low': low_y}
 
-        if not raw_data: return
+        self.price_series = [None] * self.w
+        last_valid = raw_data[0]
+        for x in range(self.w):
+            if raw_data[x] is not None:
+                last_valid = raw_data[x]
+            if last_valid:
+                self.price_series[x] = last_valid
+        print("Price data extracted.")
 
-        # Fill gaps
-        self.price_series = []
-        for i in range(len(raw_data) - 1):
-            curr = raw_data[i]
-            next_p = raw_data[i+1]
-            self.price_series.append(curr)
-            if next_p['x'] - curr['x'] > 1 and next_p['x'] - curr['x'] < 5:
-                for gap_x in range(curr['x'] + 1, next_p['x']):
-                    filled = {'x': gap_x, 'high': curr['high'], 'low': curr['low']}
-                    self.price_series.append(filled)
-                    self.price_map[gap_x] = filled
-        self.price_series.append(raw_data[-1])
-        print(f"Data points: {len(self.price_series)}")
-
-    def identify_fractals(self, window=20):
+    def find_and_cluster_swings(self, window=20, cluster_threshold=15):
         """
-        Increased window to 20 to ignore minor bumps.
+        Phase 1: Find Pivots and immediately Cluster them using Median Y.
+        This prevents creating wide/fat boxes from wicks.
         """
-        if not self.price_series: return
+        # 1. Identify Raw Pivots
+        pivots = []
+        for x in range(window, self.w - window):
+            if self.price_series[x] is None: continue
+            curr_high = self.price_series[x]['high']
+            curr_low = self.price_series[x]['low']
 
-        highs = [p['high'] for p in self.price_series]
-        lows = [p['low'] for p in self.price_series]
-        xs = [p['x'] for p in self.price_series]
-        n = len(self.price_series)
+            is_res = True
+            is_sup = True
+            for i in range(-window, window + 1):
+                p = self.price_series[x+i]
+                if not p: continue
+                if p['high'] < curr_high: is_res = False
+                if p['low'] > curr_low: is_sup = False
 
-        self.pivots = []
+            if is_res: pivots.append({'type': 'Resistance', 'x': x, 'y': curr_high})
+            if is_sup: pivots.append({'type': 'Support', 'x': x, 'y': curr_low})
 
-        for i in range(window, n - window):
-            current_high = highs[i]
-            current_low = lows[i]
+        # 2. Cluster by Median Y
+        self.zones = []
 
-            # Check Highs
-            local_min_y = np.min(highs[i-window:i+window+1])
-            if current_high == local_min_y:
-                 self.pivots.append({'type': 'Resistance', 'x': xs[i], 'y': current_high})
+        # Process Resistance and Support separately
+        for z_type in ['Resistance', 'Support']:
+            subset = [p for p in pivots if p['type'] == z_type]
+            subset.sort(key=lambda p: p['y']) # Sort by price
 
-            # Check Lows
-            local_max_y = np.max(lows[i-window:i+window+1])
-            if current_low == local_max_y:
-                self.pivots.append({'type': 'Support', 'x': xs[i], 'y': current_low})
+            used = [False] * len(subset)
 
-        print(f"Found {len(self.pivots)} raw pivots.")
+            for i in range(len(subset)):
+                if used[i]: continue
 
-    def generate_clustered_zones(self, y_tolerance=15, max_gap=200):
+                base = subset[i]
+                cluster = [base]
+                used[i] = True
+
+                # Find all neighbors within threshold
+                for j in range(i+1, len(subset)):
+                    if used[j]: continue
+                    target = subset[j]
+
+                    if abs(target['y'] - base['y']) <= cluster_threshold:
+                        cluster.append(target)
+                        used[j] = True
+
+                # If this is a valid cluster (or even a strong single point)
+                # Calculate Center Line using Median (Resistant to outliers)
+                if len(cluster) > 0:
+                    y_values = [p['y'] for p in cluster]
+                    median_y = int(np.median(y_values))
+
+                    x_coords = [p['x'] for p in cluster]
+                    start_x = min(x_coords)
+
+                    # Initialize Zone -> We will extend logic next
+                    self.zones.append({
+                        'type': z_type,
+                        'x1': start_x,
+                        'x2': start_x, # Placeholder
+                        'y': median_y, # FIXED CENTER
+                        'initial_cluster': cluster
+                    })
+
+    def extend_and_validate(self, break_tolerance=6):
         """
-        NEW LOGIC: Discontinuous Zones with Break Detection.
-        Groups pivots into chains.
-        - Checks X-gap (max_gap)
-        - Checks if price BROKE the level in between (break detection)
+        Phase 2: Extend the FIXED center line forward until it breaks.
         """
-        if not self.pivots: return
+        valid_zones = []
 
-        # Sort pivots by X (Time)
-        self.pivots.sort(key=lambda p: p['x'])
+        for z in self.zones:
+            level_y = z['y']
+            start_x = z['x1']
+            type_z = z['type']
 
-        self.sd_zones = []
-        active_chains = [] # List of dicts: {'type', 'y_sum', 'count', 'start_x', 'last_x', 'pivots'}
+            end_x = self.w
 
-        for p in self.pivots:
+            # Scan forward from start
+            for x in range(start_x + 10, self.w):
+                bar = self.price_series[x]
+                if not bar: continue
 
-            # 1. Try to fit this pivot into an existing active chain
-            best_chain = None
-            min_dist = float('inf')
+                if type_z == 'Resistance':
+                    # Break: Price closes ABOVE the center line + tolerance
+                    if bar['high'] < (level_y - break_tolerance):
+                        end_x = x
+                        break
+                else:
+                    # Break: Price closes BELOW the center line + tolerance
+                    if bar['low'] > (level_y + break_tolerance):
+                        end_x = x
+                        break
 
-            # Check all active chains
-            for chain in active_chains:
-                # STRICT TYPE CHECK: Only connect Support to Support, Resistance to Resistance
-                if chain['type'] != p['type']:
-                    continue
+            length = end_x - start_x
+            # Filter noise: Must last at least 40px
+            if length > 40:
+                z['x2'] = end_x
+                valid_zones.append(z)
 
-                # Calculate average Y of the chain
-                avg_y = chain['y_sum'] / chain['count']
+        self.zones = valid_zones
+        print(f"Generated {len(self.zones)} Fixed-Height Zones.")
 
-                # Check Y proximity
-                if abs(p['y'] - avg_y) <= y_tolerance:
-                    # Check X Gap
-                    if (p['x'] - chain['last_x']) <= max_gap:
+    def bridge_gaps(self, gap_threshold=40):
+        """
+        Phase 3: The "Ghost" Logic.
+        Connects broken zones if they align perfectly and gap is small.
+        """
+        if not self.zones: return
 
-                        # --- BREAK DETECTION ---
-                        # Check if price violated the level between chain['last_x'] and p['x']
-                        is_broken = False
-                        start_check = chain['last_x'] + 1
-                        end_check = p['x']
+        # Sort by X start
+        self.zones.sort(key=lambda z: z['x1'])
 
-                        # We only check if there is data in between
-                        if start_check < end_check:
-                            check_type = chain['type']
+        merged = []
+        while len(self.zones) > 0:
+            current = self.zones.pop(0)
 
-                            for x_k in range(start_check, end_check):
-                                if x_k >= len(self.price_map) or self.price_map[x_k] is None:
-                                    continue
+            merged_happen = True
+            while merged_happen:
+                merged_happen = False
+                # Look for a partner in the remaining list
+                for i, candidate in enumerate(self.zones):
 
-                                price_bar = self.price_map[x_k]
+                    # Must be same type and same height (Tight vertical tolerance)
+                    if current['type'] == candidate['type']:
+                        if abs(current['y'] - candidate['y']) < 8:
 
-                                if check_type == 'Resistance':
-                                    # Break if High is significantly ABOVE the level
-                                    if price_bar['high'] < (avg_y - 5):
-                                        is_broken = True
-                                        break
-                                elif check_type == 'Support':
-                                    # Break if Low is significantly BELOW the level
-                                    if price_bar['low'] > (avg_y + 5):
-                                        is_broken = True
-                                        break
+                            # Check Gap
+                            gap = candidate['x1'] - current['x2']
 
-                        if not is_broken:
-                            # It fits! Check if it's the *best* fit
-                            dist = abs(p['y'] - avg_y)
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_chain = chain
-            if best_chain:
-                # Add to existing
-                best_chain['y_sum'] += p['y']
-                best_chain['count'] += 1
-                best_chain['last_x'] = p['x']
-                best_chain['pivots'].append(p)
-            else:
-                # Start new chain
-                active_chains.append({
-                    'type': p['type'], # Initial type, might mix later
-                    'y_sum': p['y'],
-                    'count': 1,
-                    'start_x': p['x'],
-                    'last_x': p['x'],
-                    'pivots': [p]
-                })
+                            # Valid Gap Bridge?
+                            # Allow gap if < threshold OR overlapping
+                            if gap < gap_threshold:
+                                # MERGE
+                                current['x2'] = max(current['x2'], candidate['x2'])
+                                # Recalculate Y center for better accuracy
+                                current['y'] = int((current['y'] + candidate['y']) / 2)
 
-        # Convert chains to zones
-        for chain in active_chains:
-            # RULE: Must have at least 2 points AND some width
-            if chain['count'] < 2: continue
+                                self.zones.pop(i)
+                                merged_happen = True
+                                break
 
-            width = chain['last_x'] - chain['start_x']
-            if width < 20: continue # Filter out tiny "dots"
+            merged.append(current)
 
-            avg_y = int(chain['y_sum'] / chain['count'])
-
-            # Determine dominant type
-            res_c = sum(1 for p in chain['pivots'] if p['type'] == 'Resistance')
-            sup_c = sum(1 for p in chain['pivots'] if p['type'] == 'Support')
-            z_type = 'Resistance' if res_c >= sup_c else 'Support'
-
-            self.sd_zones.append({
-                'type': z_type,
-                'y_top': avg_y - 10,
-                'y_bottom': avg_y + 10,
-                'start_x': chain['start_x'],
-                'end_x': chain['last_x'], # Finite end!
-                'strength': chain['count']
-            })
-
-        print(f"Generated {len(self.sd_zones)} discontinuous zones.")
+        self.zones = merged
+        print(f"Bridged gaps, final count: {len(self.zones)}")
 
     def visualize(self, output_path):
         if self.original_image is None: return
 
-        overlay = self.original_image.copy()
         final_img = self.original_image.copy()
+        overlay = self.original_image.copy()
 
-        for zone in self.sd_zones:
-            x1 = zone['start_x']
-            # STRICT ENDING: No extension
-            x2 = zone['end_x']
+        # CONSTANT HEIGHT for clean look
+        # This prevents the "Fat Block" issue
+        FIXED_HEIGHT = 6 # +/- 6 pixels = 12px total height
 
-            y1 = zone['y_top']
-            y2 = zone['y_bottom']
+        for z in self.zones:
+            x1, x2 = z['x1'], z['x2']
+            y = z['y']
 
-            if zone['type'] == 'Resistance':
-                color = (0, 0, 255)
-                border = (0, 0, 180)
+            pt1 = (x1, y - FIXED_HEIGHT)
+            pt2 = (x2, y + FIXED_HEIGHT)
+
+            if z['type'] == 'Resistance':
+                color = (0, 0, 255) # Red
+                border = (0, 0, 200)
             else:
-                color = (0, 255, 0)
-                border = (0, 180, 0)
+                color = (0, 255, 0) # Green
+                border = (0, 200, 0)
 
-            # Draw Zone
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-            cv2.line(final_img, (x1, y1), (x2, y1), border, 1)
-            cv2.line(final_img, (x1, y2), (x2, y2), border, 1)
+            # Draw
+            cv2.rectangle(overlay, pt1, pt2, color, -1)
+            cv2.rectangle(final_img, pt1, pt2, border, 1)
 
-            # End Cap
-            cv2.line(final_img, (x2, y1), (x2, y2), border, 1)
+            # Center Line (The exact level)
+            cv2.line(final_img, (x1, y), (x2, y), border, 1)
 
         cv2.addWeighted(overlay, 0.3, final_img, 0.7, 0, final_img)
         cv2.imwrite(output_path, final_img)
-        print(f"Saved clean chart to {output_path}")
+        print(f"Saved to {output_path}")
 
 if __name__ == "__main__":
     from preprocessing import ChartPreprocessor
 
-    # --- SETTINGS FOR CLEAN LOOK ---
-    FRACTAL_WINDOW = 25      # Higher = Finds only major swings (reduces noise)
-    # -------------------------------
+    # --- SETTINGS ---
+    CLUSTER_DIST = 15   # Pivot grouping distance
+    GAP_BRIDGE_PX = 40  # Bridge breaks smaller than this
+    # ----------------
 
     if len(sys.argv) > 1:
         img_path = sys.argv[1]
     else:
-        print("--- Support & Resistance Cleaner ---")
-        img_path = input("Drag and drop image path: ").strip()
+        print("--- Sniper (Fixed-Height) Analyzer ---")
+        img_path = input("Image Path: ").strip()
         if img_path.startswith('"') and img_path.endswith('"'):
             img_path = img_path[1:-1]
 
@@ -242,34 +239,26 @@ if __name__ == "__main__":
         prep = ChartPreprocessor(img_path)
         try:
             prep.load_image()
-            prep.select_roi() # Ensure you select only the candle area!
+            prep.select_roi()
             mask, crop = prep.process_image()
 
-            analyzer = StockChartAnalyzer(crop, mask)
+            analyzer = SniperZoneAnalyzer(crop, mask)
             analyzer.extract_price_data()
 
-            # 1. Find Pivots
-            analyzer.identify_fractals(window=FRACTAL_WINDOW)
+            # 1. Cluster pivots by Median height
+            analyzer.find_and_cluster_swings(cluster_threshold=CLUSTER_DIST)
 
-            # 2. Generate Discontinuous Zones
-            analyzer.generate_clustered_zones(y_tolerance=15, max_gap=300)
+            # 2. Extend zones forward
+            analyzer.extend_and_validate()
 
-            # 3. Visualize
+            # 3. Bridge Gaps
+            analyzer.bridge_gaps(gap_threshold=GAP_BRIDGE_PX)
 
-            analyzer.visualize(f"clean_{os.path.basename(img_path)}")
-
-            # Auto-open the result
-            output_file = f"clean_{os.path.basename(img_path)}"
-            if os.path.exists(output_file):
-                if sys.platform == "win32":
-                    os.startfile(output_file)
-                else:
-                    import subprocess
-                    opener = "open" if sys.platform == "darwin" else "xdg-open"
-                    subprocess.call([opener, output_file])
+            output = f"sniper_{os.path.basename(img_path)}"
+            analyzer.visualize(output)
 
         except Exception as e:
-            print(e)
+            print(f"Error: {e}")
             import traceback
             traceback.print_exc()
     else:
