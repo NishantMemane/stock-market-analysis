@@ -1,265 +1,173 @@
 import cv2
 import numpy as np
-import sys
+import json
 import os
+import sys
 
-class SniperZoneAnalyzer:
-    def __init__(self, image, mask):
-        self.original_image = image
-        self.candlestick_mask = mask
-        self.price_series = []
-        self.zones = []
-        if mask is not None:
-            self.h, self.w = mask.shape
-        else:
-            self.h, self.w = (0, 0)
+class ZoneOnlyDrawer:
+    def __init__(self):
+        self.image = None
+        self.points = []
+        self.candle_mask = None
+        self.img_h = 0
+        self.img_w = 0
 
-    def extract_price_data(self):
-        if self.candlestick_mask is None: return
-        raw_data = [None] * self.w
-        for x in range(self.w):
-            column = self.candlestick_mask[:, x]
-            pixels = np.where(column > 0)[0]
-            if len(pixels) > 0:
-                high_y = np.min(pixels)
-                low_y = np.max(pixels)
-                if (low_y - high_y) > 1:
-                    raw_data[x] = {'high': high_y, 'low': low_y}
+    def load_data(self, image_path, json_path):
+        # 1. Load Image
+        self.image = cv2.imread(image_path)
+        if self.image is None:
+            print("Error: Could not load image.")
+            return False
 
-        self.price_series = [None] * self.w
-        last_valid = raw_data[0]
-        for x in range(self.w):
-            if raw_data[x] is not None:
-                last_valid = raw_data[x]
-            if last_valid:
-                self.price_series[x] = last_valid
-        print("Price data extracted.")
+        self.img_h, self.img_w, _ = self.image.shape
 
-    def find_and_cluster_swings(self, window=20, cluster_threshold=15):
+        # 2. Load JSON
+        try:
+            with open(json_path, 'r') as f:
+                self.points = json.load(f)
+            self.points.sort(key=lambda k: k['x'])
+        except Exception as e:
+            print(f"Error loading JSON: {e}")
+            return False
+
+        return True
+
+    def create_obstruction_mask(self):
         """
-        Phase 1: Find Pivots and immediately Cluster them using Median Y.
-        This prevents creating wide/fat boxes from wicks.
+        Creates a mask of obstacles (candles).
         """
-        # 1. Identify Raw Pivots
-        pivots = []
-        for x in range(window, self.w - window):
-            if self.price_series[x] is None: continue
-            curr_high = self.price_series[x]['high']
-            curr_low = self.price_series[x]['low']
+        hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
 
-            is_res = True
-            is_sup = True
-            for i in range(-window, window + 1):
-                p = self.price_series[x+i]
-                if not p: continue
-                if p['high'] < curr_high: is_res = False
-                if p['low'] > curr_low: is_sup = False
+        # Detect Black/Gray (Candles/Text/Grid)
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 120])
+        mask = cv2.inRange(hsv, lower_black, upper_black)
 
-            if is_res: pivots.append({'type': 'Resistance', 'x': x, 'y': curr_high})
-            if is_sup: pivots.append({'type': 'Support', 'x': x, 'y': curr_low})
+        # Clean up the mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        self.candle_mask = np.zeros_like(mask)
 
-        # 2. Cluster by Median Y
-        self.zones = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
 
-        # Process Resistance and Support separately
-        for z_type in ['Resistance', 'Support']:
-            subset = [p for p in pivots if p['type'] == z_type]
-            subset.sort(key=lambda p: p['y']) # Sort by price
+            # Filter: Only keep things that look like candles
+            if area > 40 or (h > 10 and w < 30):
+                cv2.drawContours(self.candle_mask, [cnt], -1, 255, -1)
 
-            used = [False] * len(subset)
+        # Remove the Pivot Dots from the mask
+        for p in self.points:
+            cv2.circle(self.candle_mask, (p['x'], p['y']), 12, 0, -1)
 
+    def is_blocked(self, p1, p2):
+        """
+        Checks if candles exist between p1 and p2.
+        """
+        x1, x2 = min(p1['x'], p2['x']), max(p1['x'], p2['x'])
+
+        # Check vertical center
+        y_center = int((p1['y'] + p2['y']) / 2)
+
+        # Check narrow strip
+        y_top = y_center - 2
+        y_bottom = y_center + 2
+
+        # Buffer x1 and x2
+        roi = self.candle_mask[y_top:y_bottom, x1+10 : x2-10]
+
+        if roi.size == 0: return False
+
+        obstruction_count = cv2.countNonZero(roi)
+
+        # RELAXED TOLERANCE
+        if obstruction_count > 15:
+            return True
+        return False
+
+    def draw_chart(self, output_filename):
+        if self.image is None: return
+
+        result = self.image.copy()
+        overlay = result.copy()
+
+        # [REMOVED] Dynamic Background Grid
+        # [REMOVED] Zig Zag Lines
+
+        # --- Zone Logic ---
+        highs = [p for p in self.points if p['type'] == 'High']
+        lows = [p for p in self.points if p['type'] == 'Low']
+
+        # DYNAMIC TOLERANCE: 5% of image height
+        tolerance = self.img_h * 0.05
+
+        def process_zones(subset, color):
             for i in range(len(subset)):
-                if used[i]: continue
+                p1 = subset[i]
 
-                base = subset[i]
-                cluster = [base]
-                used[i] = True
+                # Check all future points
+                for j in range(i + 1, len(subset)):
+                    p2 = subset[j]
 
-                # Find all neighbors within threshold
-                for j in range(i+1, len(subset)):
-                    if used[j]: continue
-                    target = subset[j]
+                    # 1. Vertical Alignment Check
+                    if abs(p1['y'] - p2['y']) < tolerance:
 
-                    if abs(target['y'] - base['y']) <= cluster_threshold:
-                        cluster.append(target)
-                        used[j] = True
+                        # 2. Obstruction Check
+                        if not self.is_blocked(p1, p2):
+                            # DRAW ZONE
+                            top = min(p1['y'], p2['y']) - 8
+                            bottom = max(p1['y'], p2['y']) + 8
 
-                # If this is a valid cluster (or even a strong single point)
-                # Calculate Center Line using Median (Resistant to outliers)
-                if len(cluster) > 0:
-                    y_values = [p['y'] for p in cluster]
-                    median_y = int(np.median(y_values))
+                            cv2.rectangle(overlay, (p1['x'], top), (p2['x'], bottom), color, -1)
+                            cv2.rectangle(result, (p1['x'], top), (p2['x'], bottom), color, 1)
 
-                    x_coords = [p['x'] for p in cluster]
-                    start_x = min(x_coords)
+                            # Break after finding nearest connection
+                            break
+                        else:
+                            # If obstructed, stop checking this p1
+                            break
 
-                    # Initialize Zone -> We will extend logic next
-                    self.zones.append({
-                        'type': z_type,
-                        'x1': start_x,
-                        'x2': start_x, # Placeholder
-                        'y': median_y, # FIXED CENTER
-                        'initial_cluster': cluster
-                    })
+        # Draw Resistance (Red)
+        process_zones(highs, (0, 0, 255))
+        # Draw Support (Green)
+        process_zones(lows, (0, 255, 0))
 
-    def extend_and_validate(self, break_tolerance=6):
-        """
-        Phase 2: Extend the FIXED center line forward until it breaks.
-        """
-        valid_zones = []
+        # Blend Transparency
+        cv2.addWeighted(overlay, 0.4, result, 0.6, 0, result)
 
-        for z in self.zones:
-            level_y = z['y']
-            start_x = z['x1']
-            type_z = z['type']
+        # --- Dots & Labels ---
+        for p in self.points:
+            color = (0, 255, 0) if p['type'] == 'High' else (0, 0, 255)
 
-            end_x = self.w
+            # Dot
+            cv2.circle(result, (p['x'], p['y']), 5, color, -1)
+            cv2.circle(result, (p['x'], p['y']), 6, (0,0,0), 1)
 
-            # Scan forward from start
-            for x in range(start_x + 10, self.w):
-                bar = self.price_series[x]
-                if not bar: continue
+            # Label
+            label = p.get('label', '')
+            if label:
+                label_y = p['y'] - 15 if p['type'] == 'High' else p['y'] + 25
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                # White background for text
+                cv2.rectangle(result, (p['x']-10, label_y-th), (p['x']-10+tw, label_y+3), (255,255,255), -1)
+                cv2.putText(result, label, (p['x']-10, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
 
-                if type_z == 'Resistance':
-                    # Break: Price closes ABOVE the center line + tolerance
-                    if bar['high'] < (level_y - break_tolerance):
-                        end_x = x
-                        break
-                else:
-                    # Break: Price closes BELOW the center line + tolerance
-                    if bar['low'] > (level_y + break_tolerance):
-                        end_x = x
-                        break
-
-            length = end_x - start_x
-            # Filter noise: Must last at least 40px
-            if length > 40:
-                z['x2'] = end_x
-                valid_zones.append(z)
-
-        self.zones = valid_zones
-        print(f"Generated {len(self.zones)} Fixed-Height Zones.")
-
-    def bridge_gaps(self, gap_threshold=40):
-        """
-        Phase 3: The "Ghost" Logic.
-        Connects broken zones if they align perfectly and gap is small.
-        """
-        if not self.zones: return
-
-        # Sort by X start
-        self.zones.sort(key=lambda z: z['x1'])
-
-        merged = []
-        while len(self.zones) > 0:
-            current = self.zones.pop(0)
-
-            merged_happen = True
-            while merged_happen:
-                merged_happen = False
-                # Look for a partner in the remaining list
-                for i, candidate in enumerate(self.zones):
-
-                    # Must be same type and same height (Tight vertical tolerance)
-                    if current['type'] == candidate['type']:
-                        if abs(current['y'] - candidate['y']) < 8:
-
-                            # Check Gap
-                            gap = candidate['x1'] - current['x2']
-
-                            # Valid Gap Bridge?
-                            # Allow gap if < threshold OR overlapping
-                            if gap < gap_threshold:
-                                # MERGE
-                                current['x2'] = max(current['x2'], candidate['x2'])
-                                # Recalculate Y center for better accuracy
-                                current['y'] = int((current['y'] + candidate['y']) / 2)
-
-                                self.zones.pop(i)
-                                merged_happen = True
-                                break
-
-            merged.append(current)
-
-        self.zones = merged
-        print(f"Bridged gaps, final count: {len(self.zones)}")
-
-    def visualize(self, output_path):
-        if self.original_image is None: return
-
-        final_img = self.original_image.copy()
-        overlay = self.original_image.copy()
-
-        # CONSTANT HEIGHT for clean look
-        # This prevents the "Fat Block" issue
-        FIXED_HEIGHT = 6 # +/- 6 pixels = 12px total height
-
-        for z in self.zones:
-            x1, x2 = z['x1'], z['x2']
-            y = z['y']
-
-            pt1 = (x1, y - FIXED_HEIGHT)
-            pt2 = (x2, y + FIXED_HEIGHT)
-
-            if z['type'] == 'Resistance':
-                color = (0, 0, 255) # Red
-                border = (0, 0, 200)
-            else:
-                color = (0, 255, 0) # Green
-                border = (0, 200, 0)
-
-            # Draw
-            cv2.rectangle(overlay, pt1, pt2, color, -1)
-            cv2.rectangle(final_img, pt1, pt2, border, 1)
-
-            # Center Line (The exact level)
-            cv2.line(final_img, (x1, y), (x2, y), border, 1)
-
-        cv2.addWeighted(overlay, 0.3, final_img, 0.7, 0, final_img)
-        cv2.imwrite(output_path, final_img)
-        print(f"Saved to {output_path}")
+        cv2.imwrite(output_filename, result)
+        print(f"Saved to {output_filename}")
+        cv2.imshow("Zones Only Analysis", result)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    from preprocessing import ChartPreprocessor
+    print("--- Zone Only Drawer (No Grid/ZigZag) ---")
+    img_input = input("Enter Chart Image Path: ").strip().strip('"')
+    json_input = input("Enter JSON File Path: ").strip().strip('"')
 
-    # --- SETTINGS ---
-    CLUSTER_DIST = 15   # Pivot grouping distance
-    GAP_BRIDGE_PX = 40  # Bridge breaks smaller than this
-    # ----------------
+    if os.path.exists(img_input) and os.path.exists(json_input):
+        app = ZoneOnlyDrawer()
+        if app.load_data(img_input, json_input):
+            app.create_obstruction_mask()
 
-    if len(sys.argv) > 1:
-        img_path = sys.argv[1]
+            out_file = "zones_" + os.path.basename(img_input)
+            app.draw_chart(out_file)
     else:
-        print("--- Sniper (Fixed-Height) Analyzer ---")
-        img_path = input("Image Path: ").strip()
-        if img_path.startswith('"') and img_path.endswith('"'):
-            img_path = img_path[1:-1]
-
-    if os.path.exists(img_path):
-        prep = ChartPreprocessor(img_path)
-        try:
-            prep.load_image()
-            prep.select_roi()
-            mask, crop = prep.process_image()
-
-            analyzer = SniperZoneAnalyzer(crop, mask)
-            analyzer.extract_price_data()
-
-            # 1. Cluster pivots by Median height
-            analyzer.find_and_cluster_swings(cluster_threshold=CLUSTER_DIST)
-
-            # 2. Extend zones forward
-            analyzer.extend_and_validate()
-
-            # 3. Bridge Gaps
-            analyzer.bridge_gaps(gap_threshold=GAP_BRIDGE_PX)
-
-            output = f"sniper_{os.path.basename(img_path)}"
-            analyzer.visualize(output)
-
-        except Exception as e:
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print("File not found.")
+        print("Files not found.")
