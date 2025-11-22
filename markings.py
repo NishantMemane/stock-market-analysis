@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import sys
 import os
+import json
 from scipy.signal import find_peaks, savgol_filter
 
 class ChartPreprocessor:
@@ -322,6 +323,26 @@ class StockChartAnalyzer:
         print(f"Result saved to {output_path}")
         return result_img
 
+    def save_markings_to_json(self, output_path):
+        """
+        Exports the identified pivots and their labels to a JSON file.
+        """
+        data = []
+        for pivot in self.pivots:
+            item = {
+                'type': pivot['type'],
+                'x': int(pivot['x']),
+                'y': int(pivot['y']),
+                'val': float(pivot['val'])
+            }
+            if 'label' in pivot:
+                item['label'] = pivot['label']
+            data.append(item)
+
+        with open(output_path, 'w') as f:
+            json.dump(data, f, indent=4)
+        print(f"Markings saved to {output_path}")
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         img_path = sys.argv[1]
@@ -363,6 +384,9 @@ if __name__ == "__main__":
 
             output_filename = f"analyzed_{os.path.basename(img_path)}"
             analyzer.visualize_results(output_path=output_filename)
+
+            json_output_filename = f"markings_{os.path.splitext(os.path.basename(img_path))[0]}.json"
+            analyzer.save_markings_to_json(json_output_filename)
         except Exception as e:
             print(f"An error occurred: {e}")
             import traceback
