@@ -11,6 +11,8 @@ class ChartPreprocessor:
         self.original_image = None
         self.cropped_image = None
         self.mask = None
+        self.crop_x = 0
+        self.crop_y = 0
 
     def load_image(self):
         """Loads the image from the specified path."""
@@ -41,6 +43,8 @@ class ChartPreprocessor:
             else:
                 # Crop the image
                 x, y, w, h = int(r[0]), int(r[1]), int(r[2]), int(r[3])
+                self.crop_x = x
+                self.crop_y = y
                 self.cropped_image = self.original_image[y:y+h, x:x+w]
                 print(f"Image cropped to: {x}, {y}, {w}, {h}")
 
